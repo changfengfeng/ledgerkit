@@ -127,3 +127,13 @@ def test_csv_roundtrip(rates, tmp_path):
 def test_from_csv_rejects_bad_rows():
     with pytest.raises(LedgerError):
         RateTable.from_csv("base,quote,date,value\nEUR,USD,notadate,1.1\n")
+
+
+def test_memoised_lookup_respects_date():
+    table = RateTable()
+    table.add("EUR", "USD", date(2024, 1, 1), "1.10")
+    table.add("EUR", "USD", date(2024, 2, 1), "1.20")
+    assert table.get_rate("EUR", "USD", date(2024, 1, 15)) == Decimal("1.10")
+    assert table.get_rate("EUR", "USD", date(2024, 2, 15)) == Decimal("1.20")
+    assert table.get_rate("EUR", "USD", date(2024, 1, 15)) == Decimal("1.10")
+    assert table.get_rate("USD", "EUR", date(2024, 2, 15)) == Decimal(1) / Decimal("1.20")

@@ -49,7 +49,7 @@ class RateTable:
         self.max_age_days = max_age_days
         self._dates: dict[tuple[str, str], list[date]] = {}
         self._rates: dict[tuple[str, str], list[Rate]] = {}
-        self._cache: dict[tuple[str, str], Decimal] = {}
+        self._cache: dict[tuple[str, str, date], Decimal] = {}
 
     # -- mutation -----------------------------------------------------------
     def add(
@@ -134,9 +134,9 @@ class RateTable:
         if base == quote:
             return ONE
         when = on_date or date.today()
-        # Pair-level memoisation: report generation converts thousands of
+        # Memoised per (pair, date): report generation converts thousands of
         # postings and the resolution path (direct -> inverse -> pivot) is hot.
-        key = (base, quote)
+        key = (base, quote, when)
         cached = self._cache.get(key)
         if cached is not None:
             return cached
