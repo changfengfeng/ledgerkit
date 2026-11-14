@@ -1,0 +1,11 @@
+[
+  {"pattern": "payroll", "account": "Income:Salary", "payee": "ACME Corp", "direction": "in", "priority": 10},
+  {"pattern": "landlord|property mgmt", "account": "Expenses:Rent", "payee": "Landlord", "tags": ["housing"]},
+  {"pattern": "whole foods|trader joe", "account": "Expenses:Food", "tags": ["groceries"]},
+  {"pattern": "starbucks|coffee", "account": "Expenses:Food", "tags": ["coffee"]},
+  {"pattern": "power|water|gas co", "account": "Expenses:Utilities", "tags": ["bills"]},
+  {"pattern": "transfer to savings", "account": "Assets:Bank:Savings"},
+  {"pattern": "spotify|netflix", "account": "Expenses:Subscriptions", "tags": ["subscriptions"]},
+  {"pattern": "bank fee", "account": "Expenses:Fees"},
+  {"pattern": "interest", "account": "Income:Interest", "direction": "in"}
+]

@@ -1,0 +1,56 @@
+; ledgerkit sample file
+option "title" "Household 2024"
+option "operating_currency" "USD"
+
+2024-01-01 open Assets:Bank:Checking USD
+2024-01-01 open Assets:Bank:Savings USD
+2024-01-01 open Assets:Cash
+2024-01-01 open Assets:Brokerage
+2024-01-01 open Liabilities:CreditCard USD,EUR
+2024-01-01 open Equity:Opening-Balances
+2024-01-01 open Income:Salary USD
+2024-01-01 open Income:Interest
+2024-01-01 open Expenses:Food
+2024-01-01 open Expenses:Rent
+2024-01-01 open Expenses:Travel
+2024-01-01 open Expenses:Utilities
+2024-01-01 commodity AAPL 4
+
+2024-01-01 rate EUR USD 1.1050
+2024-02-01 rate EUR USD 1.0800
+2024-03-01 rate EUR USD 1.0900
+
+2024-01-01 * "Opening balance"
+  Assets:Bank:Checking     2500.00 USD
+  Assets:Bank:Savings     10000.00 USD
+  Equity:Opening-Balances
+
+2024-01-03 * "Landlord" "January rent" #housing
+  Expenses:Rent            1450.00 USD
+  Assets:Bank:Checking
+
+2024-01-15 * "ACME Corp" "Salary" ^payroll-2024-01
+  Assets:Bank:Checking     4200.00 USD
+  Income:Salary
+
+2024-01-20 * "Grocer" "Weekly shopping"
+  Expenses:Food              86.40 USD ; organic
+  Liabilities:CreditCard
+
+2024-02-10 * "Hotel Lumiere" "Paris trip" #travel
+  Expenses:Travel           320.00 EUR
+  Liabilities:CreditCard
+
+2024-02-12 * "Broker" "Buy shares"
+  Assets:Brokerage            5 AAPL @ 182.50 USD
+  Assets:Bank:Savings
+
+2024-02-28 balance Assets:Bank:Checking 5250.00 USD
+
+2024-03-05 * "Cafe de Flore" "Coffee" #travel
+  Expenses:Food              12.50 EUR
+  Liabilities:CreditCard
+
+2024-03-31 * "Bank" "Interest"
+  Assets:Bank:Savings         8.12 USD
+  Income:Interest

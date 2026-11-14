@@ -1,0 +1,11 @@
+{
+  "name": "household-2024",
+  "currency": "USD",
+  "rollover": true,
+  "lines": [
+    {"account": "Expenses:Rent", "period": "2024", "amount": "1450.00"},
+    {"account": "Expenses:Food", "period": "2024", "amount": "400.00"},
+    {"account": "Expenses:Utilities", "period": "2024", "amount": "120.00"},
+    {"account": "Expenses:Travel", "period": "2024-Q1", "amount": "300.00"}
+  ]
+}

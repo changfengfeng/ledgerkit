@@ -1,0 +1,330 @@
+"""SQLite backend.
+
+Schema overview::
+
+    accounts(name PK, opened, closed, currencies, description, meta)
+    rates(base, quote, date, value, source)       PK(base, quote, date)
+    transactions(id PK, date, flag, payee, narration, tags, links, meta,
+                 voided, voided_by, reversal_of)
+    postings(tx_id FK, position, account, amount, currency,
+             price_amount, price_currency, memo, flag, meta)
+    settings(key PK, value)
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+
+from ..accounts import Account, ChartOfAccounts
+from ..currency import RateTable
+from ..errors import LedgerError, StorageError
+from ..journal import Journal
+from ..money import Money
+from ..transactions import Posting, Transaction
+from .base import Repository
+
+SCHEMA_VERSION = 3
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS accounts (
+    name        TEXT PRIMARY KEY,
+    opened      TEXT NOT NULL,
+    closed      TEXT,
+    currencies  TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    meta        TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS rates (
+    base   TEXT NOT NULL,
+    quote  TEXT NOT NULL,
+    date   TEXT NOT NULL,
+    value  TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'manual',
+    PRIMARY KEY (base, quote, date)
+);
+CREATE TABLE IF NOT EXISTS transactions (
+    id          TEXT PRIMARY KEY,
+    date        TEXT NOT NULL,
+    flag        TEXT NOT NULL DEFAULT '*',
+    payee       TEXT NOT NULL DEFAULT '',
+    narration   TEXT NOT NULL DEFAULT '',
+    tags        TEXT NOT NULL DEFAULT '',
+    links       TEXT NOT NULL DEFAULT '',
+    meta        TEXT NOT NULL DEFAULT '{}',
+    voided      INTEGER NOT NULL DEFAULT 0,
+    voided_by   TEXT,
+    reversal_of TEXT
+);
+CREATE TABLE IF NOT EXISTS postings (
+    tx_id          TEXT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+    position       INTEGER NOT NULL,
+    account        TEXT NOT NULL,
+    amount         NUMERIC NOT NULL,
+    currency       TEXT NOT NULL,
+    price_amount   NUMERIC,
+    price_currency TEXT,
+    memo           TEXT NOT NULL DEFAULT '',
+    flag           TEXT NOT NULL DEFAULT '',
+    meta           TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (tx_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date);
+CREATE INDEX IF NOT EXISTS idx_postings_account ON postings(account);
+"""
+
+
+class SqliteStore(Repository):
+    def __init__(self, path: str | Path) -> None:
+        self.path = str(path)
+        self._lock = threading.RLock()
+        self._conn: sqlite3.Connection | None = None
+
+    # -- connection -----------------------------------------------------------
+    @property
+    def conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            try:
+                self._conn = sqlite3.connect(self.path, check_same_thread=False)
+            except sqlite3.Error as exc:
+                raise StorageError(f"cannot open database {self.path}: {exc}") from None
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            self._migrate()
+        return self._conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    @contextmanager
+    def _tx(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            conn = self.conn
+            try:
+                conn.execute("BEGIN")
+                yield conn
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def _migrate(self) -> None:
+        assert self._conn is not None
+        self._conn.isolation_level = None  # explicit transaction control
+        self._conn.executescript(SCHEMA)
+        row = self._conn.execute("SELECT value FROM settings WHERE key = 'schema_version'").fetchone()
+        if row is None:
+            self._conn.execute(
+                "INSERT INTO settings(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
+            )
+        elif int(row["value"]) > SCHEMA_VERSION:
+            raise StorageError(
+                f"database schema version {row['value']} is newer than supported ({SCHEMA_VERSION})"
+            )
+
+    def exists(self) -> bool:
+        if self.path == ":memory:":
+            return self._conn is not None
+        if not Path(self.path).exists():
+            return False
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()
+        return bool(row["n"])
+
+    # -- writing --------------------------------------------------------------
+    def _write_account(self, conn: sqlite3.Connection, account: Account) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO accounts(name, opened, closed, currencies, description, meta)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                account.name,
+                account.opened.isoformat(),
+                account.closed.isoformat() if account.closed else None,
+                ",".join(sorted(account.currencies)),
+                account.description,
+                json.dumps(account.meta, sort_keys=True),
+            ),
+        )
+
+    def _write_transaction(self, conn: sqlite3.Connection, tx: Transaction) -> None:
+        if tx.id is None:
+            raise StorageError("cannot store a transaction without id")
+        conn.execute("DELETE FROM postings WHERE tx_id = ?", (tx.id,))
+        conn.execute(
+            "INSERT OR REPLACE INTO transactions(id, date, flag, payee, narration, tags, links, meta,"
+            " voided, voided_by, reversal_of) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                tx.id,
+                tx.date.isoformat(),
+                tx.flag,
+                tx.payee,
+                tx.narration,
+                " ".join(sorted(tx.tags)),
+                " ".join(sorted(tx.links)),
+                json.dumps(tx.meta, sort_keys=True),
+                1 if tx.voided else 0,
+                tx.voided_by,
+                tx.reversal_of,
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO postings(tx_id, position, account, amount, currency, price_amount,"
+            " price_currency, memo, flag, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    tx.id,
+                    position,
+                    p.account,
+                    str(p.amount.amount),
+                    p.amount.currency,
+                    str(p.price.amount) if p.price else None,
+                    p.price.currency if p.price else None,
+                    p.memo,
+                    p.flag,
+                    json.dumps(p.meta, sort_keys=True),
+                )
+                for position, p in enumerate(tx.postings)
+            ],
+        )
+
+    def save(self, journal: Journal) -> None:
+        with self._tx() as conn:
+            conn.execute("DELETE FROM postings")
+            conn.execute("DELETE FROM transactions")
+            conn.execute("DELETE FROM rates")
+            conn.execute("DELETE FROM accounts")
+            for account in journal.chart:
+                self._write_account(conn, account)
+            conn.executemany(
+                "INSERT INTO rates(base, quote, date, value, source) VALUES (?, ?, ?, ?, ?)",
+                [(r.base, r.quote, r.date.isoformat(), str(r.value), r.source) for r in journal.rates],
+            )
+            for tx in journal.sorted():
+                self._write_transaction(conn, tx)
+            self._write_settings(conn, journal)
+
+    def _write_settings(self, conn: sqlite3.Connection, journal: Journal) -> None:
+        conn.execute("DELETE FROM settings WHERE key != 'schema_version'")
+        values = {
+            "options": json.dumps(journal.options, sort_keys=True),
+            "pivot": journal.rates.pivot,
+            "locked_through": journal.locked_through.isoformat() if journal.locked_through else "",
+            "id_prefix": journal.id_prefix,
+        }
+        conn.executemany("INSERT INTO settings(key, value) VALUES (?, ?)", list(values.items()))
+
+    def attach(self, journal: Journal) -> None:
+        """Persist every subsequent change to ``journal`` immediately."""
+
+        def on_event(event: str, tx: Transaction) -> None:
+            with self._tx() as conn:
+                for account in journal.chart:
+                    self._write_account(conn, account)
+                if event == "remove":
+                    conn.execute("DELETE FROM transactions WHERE id = ?", (tx.id,))
+                else:
+                    self._write_transaction(conn, tx)
+
+        journal.subscribe(on_event)
+
+    # -- reading --------------------------------------------------------------
+    def _settings(self) -> dict[str, str]:
+        rows = self.conn.execute("SELECT key, value FROM settings").fetchall()
+        return {row["key"]: row["value"] for row in rows}
+
+    def _read_chart(self) -> ChartOfAccounts:
+        chart = ChartOfAccounts()
+        for row in self.conn.execute("SELECT * FROM accounts ORDER BY name"):
+            chart.add(
+                Account(
+                    name=row["name"],
+                    opened=date.fromisoformat(row["opened"]),
+                    closed=date.fromisoformat(row["closed"]) if row["closed"] else None,
+                    currencies=frozenset(c for c in row["currencies"].split(",") if c),
+                    description=row["description"],
+                    meta=json.loads(row["meta"]),
+                )
+            )
+        return chart
+
+    def _read_rates(self, pivot: str) -> RateTable:
+        table = RateTable(pivot=pivot)
+        for row in self.conn.execute("SELECT * FROM rates ORDER BY base, quote, date"):
+            table.add(row["base"], row["quote"], date.fromisoformat(row["date"]), Decimal(row["value"]), row["source"])
+        return table
+
+    def _read_postings(self) -> dict[str, list[Posting]]:
+        postings: dict[str, list[Posting]] = {}
+        for row in self.conn.execute("SELECT * FROM postings ORDER BY tx_id, position"):
+            price = None
+            if row["price_amount"] is not None:
+                price = Money(Decimal(row["price_amount"]), row["price_currency"])
+            postings.setdefault(row["tx_id"], []).append(
+                Posting(
+                    account=row["account"],
+                    amount=Money(Decimal(row["amount"]), row["currency"]),
+                    price=price,
+                    memo=row["memo"],
+                    flag=row["flag"],
+                    meta=json.loads(row["meta"]),
+                )
+            )
+        return postings
+
+    def load(self) -> Journal:
+        with self._lock:
+            settings = self._settings()
+            journal = Journal(
+                chart=self._read_chart(),
+                rates=self._read_rates(settings.get("pivot", "USD")),
+                id_prefix=settings.get("id_prefix", "tx"),
+            )
+            journal.options.update(json.loads(settings.get("options", "{}")))
+            postings = self._read_postings()
+            for row in self.conn.execute("SELECT * FROM transactions ORDER BY date, id"):
+                tx = Transaction(
+                    id=row["id"],
+                    date=date.fromisoformat(row["date"]),
+                    flag=row["flag"],
+                    payee=row["payee"],
+                    narration=row["narration"],
+                    tags=set(row["tags"].split()),
+                    links=set(row["links"].split()),
+                    meta=json.loads(row["meta"]),
+                    voided=bool(row["voided"]),
+                    voided_by=row["voided_by"],
+                    reversal_of=row["reversal_of"],
+                    postings=postings.get(row["id"], []),
+                )
+                try:
+                    tx.validate()
+                except LedgerError as exc:
+                    raise StorageError(f"corrupt transaction {tx.id} in {self.path}: {exc}") from exc
+                journal.add(tx, validate=False)
+            if settings.get("locked_through"):
+                journal.lock_through(date.fromisoformat(settings["locked_through"]))
+            return journal
+
+    # -- queries --------------------------------------------------------------
+    def count(self, table: str) -> int:
+        if table not in ("accounts", "rates", "transactions", "postings"):
+            raise StorageError(f"unknown table {table!r}")
+        return int(self.conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
+
+    def account_totals(self) -> dict[tuple[str, str], Decimal]:
+        """Per (account, currency) totals computed inside SQLite."""
+        rows = self.conn.execute(
+            "SELECT account, currency, SUM(amount) AS total FROM postings GROUP BY account, currency"
+        )
+        return {(r["account"], r["currency"]): Decimal(str(r["total"])) for r in rows}
