@@ -30,9 +30,36 @@ from ..money import Money
 from ..transactions import Posting, Transaction
 from .base import Repository
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
-SCHEMA = """
+
+def _decimal(value: str | int | float) -> Decimal:
+    # Databases written before schema 4 may hold binary floats; repr() gives
+    # the shortest decimal that round-trips, i.e. the value originally stored.
+    if isinstance(value, float):
+        return Decimal(repr(value))
+    return Decimal(value)
+
+
+POSTINGS_INDEX = "CREATE INDEX IF NOT EXISTS idx_postings_account ON postings(account);\n"
+
+POSTINGS_COLUMNS = """ (
+    tx_id          TEXT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+    position       INTEGER NOT NULL,
+    account        TEXT NOT NULL,
+    amount         TEXT NOT NULL,
+    currency       TEXT NOT NULL,
+    price_amount   TEXT,
+    price_currency TEXT,
+    memo           TEXT NOT NULL DEFAULT '',
+    flag           TEXT NOT NULL DEFAULT '',
+    meta           TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (tx_id, position)
+);
+"""
+
+SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -66,22 +93,11 @@ CREATE TABLE IF NOT EXISTS transactions (
     voided_by   TEXT,
     reversal_of TEXT
 );
-CREATE TABLE IF NOT EXISTS postings (
-    tx_id          TEXT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    position       INTEGER NOT NULL,
-    account        TEXT NOT NULL,
-    amount         NUMERIC NOT NULL,
-    currency       TEXT NOT NULL,
-    price_amount   NUMERIC,
-    price_currency TEXT,
-    memo           TEXT NOT NULL DEFAULT '',
-    flag           TEXT NOT NULL DEFAULT '',
-    meta           TEXT NOT NULL DEFAULT '{}',
-    PRIMARY KEY (tx_id, position)
-);
 CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date);
-CREATE INDEX IF NOT EXISTS idx_postings_account ON postings(account);
-"""
+CREATE TABLE IF NOT EXISTS postings"""
+    + POSTINGS_COLUMNS
+    + POSTINGS_INDEX
+)
 
 
 class SqliteStore(Repository):
@@ -133,6 +149,50 @@ class SqliteStore(Repository):
             raise StorageError(
                 f"database schema version {row['value']} is newer than supported ({SCHEMA_VERSION})"
             )
+        elif int(row["value"]) < 4:
+            self._migrate_postings_to_text()
+
+    def _migrate_postings_to_text(self) -> None:
+        """Schema 4: store posting amounts as TEXT instead of NUMERIC.
+
+        NUMERIC affinity turned decimal strings into binary floats; existing
+        values are converted back to their shortest decimal representation.
+        """
+        assert self._conn is not None
+        conn = self._conn
+        conn.execute("BEGIN")
+        try:
+            rows = conn.execute("SELECT * FROM postings").fetchall()
+            conn.execute("CREATE TABLE postings_v4" + POSTINGS_COLUMNS)
+            conn.executemany(
+                "INSERT INTO postings_v4(tx_id, position, account, amount, currency, price_amount,"
+                " price_currency, memo, flag, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        r["tx_id"],
+                        r["position"],
+                        r["account"],
+                        str(_decimal(r["amount"])),
+                        r["currency"],
+                        None if r["price_amount"] is None else str(_decimal(r["price_amount"])),
+                        r["price_currency"],
+                        r["memo"],
+                        r["flag"],
+                        r["meta"],
+                    )
+                    for r in rows
+                ],
+            )
+            conn.execute("DROP TABLE postings")
+            conn.execute("ALTER TABLE postings_v4 RENAME TO postings")
+            conn.execute(POSTINGS_INDEX)
+            conn.execute(
+                "UPDATE settings SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def exists(self) -> bool:
         if self.path == ":memory:":
@@ -269,11 +329,11 @@ class SqliteStore(Repository):
         for row in self.conn.execute("SELECT * FROM postings ORDER BY tx_id, position"):
             price = None
             if row["price_amount"] is not None:
-                price = Money(Decimal(row["price_amount"]), row["price_currency"])
+                price = Money(_decimal(row["price_amount"]), row["price_currency"])
             postings.setdefault(row["tx_id"], []).append(
                 Posting(
                     account=row["account"],
-                    amount=Money(Decimal(row["amount"]), row["currency"]),
+                    amount=Money(_decimal(row["amount"]), row["currency"]),
                     price=price,
                     memo=row["memo"],
                     flag=row["flag"],
@@ -323,8 +383,9 @@ class SqliteStore(Repository):
         return int(self.conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
 
     def account_totals(self) -> dict[tuple[str, str], Decimal]:
-        """Per (account, currency) totals computed inside SQLite."""
-        rows = self.conn.execute(
-            "SELECT account, currency, SUM(amount) AS total FROM postings GROUP BY account, currency"
-        )
-        return {(r["account"], r["currency"]): Decimal(str(r["total"])) for r in rows}
+        """Per (account, currency) totals, summed exactly with ``Decimal``."""
+        totals: dict[tuple[str, str], Decimal] = {}
+        for r in self.conn.execute("SELECT account, currency, amount FROM postings"):
+            key = (r["account"], r["currency"])
+            totals[key] = totals.get(key, Decimal(0)) + _decimal(r["amount"])
+        return totals

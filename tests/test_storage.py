@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 
 import pytest
 
 from ledgerkit.balances import balance
 from ledgerkit.errors import LedgerError
+from ledgerkit.money import Money
 from ledgerkit.storage import JsonlStore, SqliteStore, open_repository
 from ledgerkit.transactions import TransactionBuilder
 
@@ -129,3 +131,75 @@ class TestJsonl:
         path.write_text("{not json}\n", encoding="utf-8")
         with pytest.raises(LedgerError):
             JsonlStore(path).load()
+
+
+class TestSqlitePrecision:
+    @pytest.fixture
+    def cents(self, journal):
+        journal.add(
+            TransactionBuilder(date(2024, 1, 4), "Shop")
+            .debit("Expenses:Food", "0.10", "USD")
+            .debit("Expenses:Fees", "0.20", "USD")
+            .credit("Assets:Cash", "0.30", "USD")
+            .build()
+        )
+        return journal
+
+    @pytest.fixture
+    def fractional(self, cents):
+        journal = cents
+        journal.add(
+            TransactionBuilder(date(2024, 1, 5), "Broker")
+            .posting("Assets:Bank:Checking", "10", "EUR", price=Money("1.0912345678901234567", "USD"))
+            .credit("Assets:Cash", "10.912345678901234567", "USD")
+            .build()
+        )
+        return journal
+
+    def test_decimal_roundtrip(self, fractional, tmp_path):
+        path = tmp_path / "books.db"
+        with SqliteStore(path) as store:
+            store.save(fractional)
+        with SqliteStore(path) as store:
+            loaded = store.load()
+        same(loaded, fractional)
+        for original, reloaded in zip(fractional.sorted(), loaded.sorted(), strict=True):
+            for a, b in zip(original.postings, reloaded.postings, strict=True):
+                assert str(a.amount.amount) == str(b.amount.amount)
+                assert a.price == b.price
+
+    def test_account_totals_exact(self, fractional):
+        store = SqliteStore(":memory:")
+        store.save(fractional)
+        assert store.account_totals()[("Assets:Cash", "USD")] == Decimal("-11.212345678901234567")
+
+    def test_migrates_numeric_schema(self, cents, tmp_path):
+        import sqlite3
+
+        path = tmp_path / "legacy.db"
+        with SqliteStore(path) as store:
+            store.save(cents)
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            "ALTER TABLE postings RENAME TO p_old;"
+            "CREATE TABLE postings (tx_id TEXT NOT NULL, position INTEGER NOT NULL,"
+            " account TEXT NOT NULL, amount NUMERIC NOT NULL, currency TEXT NOT NULL,"
+            " price_amount NUMERIC, price_currency TEXT, memo TEXT NOT NULL DEFAULT '',"
+            " flag TEXT NOT NULL DEFAULT '', meta TEXT NOT NULL DEFAULT '{}',"
+            " PRIMARY KEY (tx_id, position));"
+            "INSERT INTO postings SELECT * FROM p_old; DROP TABLE p_old;"
+            "UPDATE settings SET value = '3' WHERE key = 'schema_version';"
+        )
+        conn.commit()
+        assert conn.execute("SELECT typeof(amount) FROM postings LIMIT 1").fetchone()[0] == "real"
+        conn.close()
+        with SqliteStore(path) as store:
+            loaded = store.load()
+            types = {r[0] for r in store.conn.execute("SELECT typeof(amount) FROM postings")}
+            version = store.conn.execute(
+                "SELECT value FROM settings WHERE key = 'schema_version'"
+            ).fetchone()[0]
+        assert types == {"text"}
+        assert version == "4"
+        same(loaded, cents)
+        assert balance(loaded, "Expenses:Food").get("USD") == Money("0.10", "USD")

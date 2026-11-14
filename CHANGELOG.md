@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+- `Journal.void()` no longer mutates the original transaction; the reversal
+  gets its own negated postings so balances net to zero (#1).
+- `RateTable` memoises lookups per date, so later dates of a pair no longer
+  return a stale rate (#2).
+- SQLite schema 4 stores posting amounts and prices as `TEXT` so `Decimal`
+  values round-trip exactly; schema 3 databases are migrated on open (#3).
+
 ## 0.4.2
 - Reconciler widens the candidate window by `date_tolerance` when the
   statement range is inferred.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Callable, Iterable, Iterator
+from dataclasses import replace
 from datetime import date
 
 from .accounts import ChartOfAccounts, is_descendant
@@ -157,15 +158,16 @@ class Journal:
             date=when,
             payee=original.payee,
             narration=f"Void of {tx_id}" + (f": {reason}" if reason else ""),
-            postings=list(original.postings),
+            postings=[
+                replace(posting, amount=-posting.amount, meta=dict(posting.meta))
+                for posting in original.postings
+            ],
             flag=original.flag,
             tags=set(original.tags) | {"void"},
             links=set(original.links),
             meta={"void_reason": reason} if reason else {},
             reversal_of=tx_id,
         )
-        for posting in reversal.postings:
-            posting.amount = -posting.amount
         self.add(reversal)
         original.voided = True
         original.voided_by = reversal.id

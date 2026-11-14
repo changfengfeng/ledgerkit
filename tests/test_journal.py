@@ -175,3 +175,25 @@ class TestQueries:
         journal.add(t)
         assert journal.find_by_link("inv-9") == [t]
         assert journal.find_by_meta("ref", "A1") == [t]
+
+
+class TestVoid:
+    def test_void_keeps_original_postings(self, journal):
+        t = journal.add(tx(date(2024, 1, 2), "10"))
+        before = [(p.account, p.amount) for p in t.postings]
+        journal.void(t.id)
+        assert [(p.account, p.amount) for p in journal.get(t.id).postings] == before
+
+    def test_void_reversal_mirrors_postings(self, journal):
+        t = journal.add(tx(date(2024, 1, 2), "10"))
+        reversal = journal.void(t.id)
+        assert [(p.account, p.amount) for p in reversal.postings] == [
+            (p.account, -p.amount) for p in t.postings
+        ]
+        assert all(r is not o for r, o in zip(reversal.postings, t.postings, strict=True))
+
+    def test_void_nets_balances_to_zero(self, journal):
+        t = journal.add(tx(date(2024, 1, 2), "10"))
+        journal.void(t.id)
+        assert balance(journal, "Assets").get("USD").is_zero()
+        assert balance(journal, "Expenses").get("USD").is_zero()
